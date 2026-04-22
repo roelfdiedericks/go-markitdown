@@ -76,3 +76,48 @@ func TestDetectUnknown(t *testing.T) {
 		t.Fatalf("DetectReader(junk) expected error, got nil")
 	}
 }
+
+// TestFromMIME covers the MIME → Format mapping (happy paths), case and
+// parameter robustness, and a set of negatives that must resolve to
+// FormatAuto (and therefore Supports == false).
+func TestFromMIME(t *testing.T) {
+	cases := []struct {
+		mime   string
+		expect Format
+		supp   bool
+	}{
+		{"application/pdf", FormatPDF, true},
+		{"application/vnd.openxmlformats-officedocument.wordprocessingml.document", FormatDOCX, true},
+		{"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", FormatXLSX, true},
+		{"application/vnd.openxmlformats-officedocument.presentationml.presentation", FormatPPTX, true},
+		{"application/epub+zip", FormatEPUB, true},
+		{"application/x-mobipocket-ebook", FormatMOBI, true},
+		{"text/html", FormatHTML, true},
+		{"application/xhtml+xml", FormatHTML, true},
+		{"text/plain", FormatText, true},
+		{"text/markdown", FormatText, true},
+
+		{"APPLICATION/PDF", FormatPDF, true},
+		{"text/plain; charset=utf-8", FormatText, true},
+		{"  text/html  ", FormatHTML, true},
+
+		{"image/png", FormatAuto, false},
+		{"image/jpeg", FormatAuto, false},
+		{"application/zip", FormatAuto, false},
+		{"application/octet-stream", FormatAuto, false},
+		{"", FormatAuto, false},
+		{"garbage", FormatAuto, false},
+		{"application/", FormatAuto, false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.mime, func(t *testing.T) {
+			if got := FromMIME(tc.mime); got != tc.expect {
+				t.Errorf("FromMIME(%q) = %s, want %s", tc.mime, got, tc.expect)
+			}
+			if got := Supports(tc.mime); got != tc.supp {
+				t.Errorf("Supports(%q) = %v, want %v", tc.mime, got, tc.supp)
+			}
+		})
+	}
+}

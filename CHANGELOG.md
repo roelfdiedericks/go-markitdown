@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] stable - 2026-04-22
+
+- docconv: new `Supports(mime)` / `FromMIME(mime)` helpers for MIME-keyed capability checks, so callers can decide whether to feed a file to `Extract` without touching disk.
+
 ## [0.1.0] stable - 2026-04-22
 
 Initial public release. Go library (`docconv` package) plus a standalone `go-markitdown` CLI for extracting clean, LLM-ready markdown from common document formats.
@@ -26,5 +30,6 @@ Initial public release. Go library (`docconv` package) plus a standalone `go-mar
 - build system: `make build`, `make build-nofitz`, cross-compile targets for `{linux,darwin} x {amd64,arm64}` via `zig cc`, and `make install` into `$GOPATH/bin`
 - audit: `make audit` runs `golangci-lint`, `govulncheck`, and `gitleaks` against the tree, auto-installing any missing tool into `$GOBIN` on first run; `.gitleaks.toml` extends the stock rule set and allowlists test fixtures and local `.env` files
 
-[Unreleased]: https://github.com/roelfdiedericks/go-markitdown/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/roelfdiedericks/go-markitdown/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/roelfdiedericks/go-markitdown/releases/tag/v0.1.1
 [0.1.0]: https://github.com/roelfdiedericks/go-markitdown/releases/tag/v0.1.0

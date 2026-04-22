@@ -154,6 +154,19 @@ type ImageDescriber interface {
 
 The same `ImageDescriber` implementation is used for both embedded-image description (when `IncludeImages` is true) and page-level OCR (when `OCRFallback` is true). The library passes a different default prompt for each role; implementations can route on the prompt or pass it through verbatim.
 
+### Capability check
+
+Use `docconv.Supports(mime)` when you already know a file's MIME type (for example from an upload gateway) and want to decide whether to feed it to `Extract` without touching disk. `FromMIME(mime)` returns the matching `Format`, or `FormatAuto` if the MIME isn't one this library handles.
+
+```go
+if docconv.Supports(upload.MIME) {
+    md, err := docconv.ExtractReader(upload.Body, docconv.FromMIME(upload.MIME), nil)
+    // ...
+}
+```
+
+Parameters (`;charset=...`) and case are ignored; `image/*` is deliberately unsupported — send images straight to a vision model.
+
 ### Typed errors
 
 ```go

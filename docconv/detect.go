@@ -124,6 +124,46 @@ func DetectReader(r io.Reader) (Format, io.Reader, error) {
 	return FormatAuto, br, ErrUnsupportedFormat
 }
 
+// FromMIME returns the Format matching a MIME type, or FormatAuto if the MIME
+// is not one docconv can extract. Parameters (anything after ';') are ignored
+// so "text/plain; charset=utf-8" resolves the same as "text/plain". Matching
+// is case-insensitive. Never panics on malformed input.
+//
+// Images (image/*) are intentionally unmapped: callers should send images
+// directly to a vision model rather than through Extract, which returns
+// ErrUnsupportedFormat for image inputs.
+func FromMIME(mime string) Format {
+	mime = strings.TrimSpace(mime)
+	if i := strings.IndexByte(mime, ';'); i >= 0 {
+		mime = strings.TrimSpace(mime[:i])
+	}
+	switch strings.ToLower(mime) {
+	case "application/pdf":
+		return FormatPDF
+	case "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+		return FormatDOCX
+	case "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet":
+		return FormatXLSX
+	case "application/vnd.openxmlformats-officedocument.presentationml.presentation":
+		return FormatPPTX
+	case "application/epub+zip":
+		return FormatEPUB
+	case "application/x-mobipocket-ebook":
+		return FormatMOBI
+	case "text/html", "application/xhtml+xml":
+		return FormatHTML
+	case "text/plain", "text/markdown":
+		return FormatText
+	}
+	return FormatAuto
+}
+
+// Supports reports whether docconv can extract content from the given MIME
+// type. Equivalent to FromMIME(mime) != FormatAuto. Intended for callers
+// that only need a yes/no answer (e.g. deciding whether to offer a "read
+// this document" action in a UI).
+func Supports(mime string) bool { return FromMIME(mime) != FormatAuto }
+
 func detectFromExtension(path string) Format {
 	switch strings.ToLower(filepath.Ext(path)) {
 	case ".pdf":

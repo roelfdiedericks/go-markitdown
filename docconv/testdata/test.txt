@@ -1,0 +1,6 @@
+go-markitdown plain-text fixture.
+
+This file is intentionally boring. It exercises the FormatText path — direct
+byte read plus UTF-8 sanitation. Unicode check: café naïve résumé — 🦦.
+
+Trailing whitespace and blank lines around this block should be trimmed.

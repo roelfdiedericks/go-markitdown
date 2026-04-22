@@ -1,0 +1,40 @@
+# Gitleaks configuration for go-markitdown.
+#
+# Run via:
+#     make audit
+# or directly:
+#     gitleaks detect --source . --no-git --config .gitleaks.toml -v
+
+title = "go-markitdown gitleaks config"
+
+[extend]
+# Inherit the stock rule set: AWS, GCP, GitHub, Stripe, OpenAI,
+# Anthropic, Slack, etc. That's ~95% of what we actually care about —
+# somebody committing a real API key into the repo.
+useDefault = true
+
+[allowlist]
+description = "Ignore vendored/binary/generated and test-fixture paths"
+
+# Paths to skip outright. Binary OOXML fixtures are particularly
+# prone to false positives because gitleaks scans them as text; the
+# base64-encoded runs inside DOCX/PPTX occasionally match high-entropy
+# secret heuristics. `samples/` is gitignored, but `--no-git` scans
+# the working tree regardless, so explicit exclusion is belt-and-
+# braces. Test Go files may carry intentional fixture-shaped tokens.
+paths = [
+    '''\.git/.*''',
+    '''go\.sum''',
+    '''docconv/testdata/.*''',
+    '''samples/.*''',
+    '''.*_test\.go$''',
+    # Local developer secrets. The file is in .gitignore so it cannot
+    # leak via a commit; we scan the working tree (gitleaks --no-git)
+    # to catch staged-but-uncommitted files, not to police .env files
+    # that exist only on the developer's machine.
+    '''\.env$''',
+    '''\.env\..*''',
+    # Generated/vendored artefacts in future builds.
+    '''dist/.*''',
+    '''vendor/.*''',
+]

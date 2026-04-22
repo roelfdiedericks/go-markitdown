@@ -34,6 +34,17 @@ type ImageRef struct {
 	MimeType string
 	// Extension includes the leading dot.
 	Extension string
+
+	// ContextBefore is the concatenation of the slide's shape text
+	// (title + body paragraphs) at the time the image was registered.
+	// Cross-slide leakage is deliberately avoided — context is slide-
+	// scoped only.
+	ContextBefore string
+
+	// AuthorAltText is the p:nvPicPr/p:cNvPr/@descr value (the "alt text"
+	// field in PowerPoint's image properties). Empty when the slide
+	// author did not supply one.
+	AuthorAltText string
 }
 
 // WalkCtx carries per-slide state the walker needs: which images were
@@ -67,6 +78,11 @@ func Walk(r io.Reader, ctx *WalkCtx) (string, error) {
 		return "", fmt.Errorf("pptx: decode slide: %w", err)
 	}
 
+	// Pre-flatten slide text so each picture can carry it as
+	// ContextBefore. Building this once per slide keeps image
+	// registration cheap even on slides with dozens of pictures.
+	slideText := collectSlideText(&slide)
+
 	var b strings.Builder
 	b.WriteString("<section>")
 	for _, sp := range slide.CSld.SpTree.Shapes {
@@ -75,10 +91,26 @@ func Walk(r io.Reader, ctx *WalkCtx) (string, error) {
 	// Picture shapes (p:pic) live alongside p:sp under p:spTree. They
 	// carry image references directly — no text body.
 	for _, pic := range slide.CSld.SpTree.Pictures {
-		if rid := pic.BlipFill.Blip.Embed; rid != "" {
-			ctx.Images[rid] = ImageRef{ID: rid}
-			fmt.Fprintf(&b, `<p><img src="rid:%s" alt=""/></p>`, rid)
+		rid := pic.BlipFill.Blip.Embed
+		if rid == "" {
+			continue
 		}
+		// First-write wins: later slides that reuse the same rId
+		// (e.g. a slide-master logo) keep the earlier slide's
+		// context, which is the slide where the image first
+		// appears in document order.
+		if _, seen := ctx.Images[rid]; !seen {
+			descr := strings.TrimSpace(pic.NvPicPr.CNvPr.Descr)
+			if descr == "" {
+				descr = strings.TrimSpace(pic.NvPicPr.CNvPr.Title)
+			}
+			ctx.Images[rid] = ImageRef{
+				ID:            rid,
+				ContextBefore: slideText,
+				AuthorAltText: descr,
+			}
+		}
+		fmt.Fprintf(&b, `<p><img src="rid:%s" alt=""/></p>`, rid)
 	}
 	// Graphic frames (p:graphicFrame) wrap tables, charts, and other
 	// DrawingML content. Tables are the important case for us; charts
@@ -89,6 +121,48 @@ func Walk(r io.Reader, ctx *WalkCtx) (string, error) {
 	}
 	b.WriteString("</section>")
 	return b.String(), nil
+}
+
+// collectSlideText flattens every p:sp text body on a slide into one
+// compact whitespace-collapsed string. Used as ContextBefore for pictures
+// on the slide, so the describer knows it's looking at (say) a slide
+// titled "Network architecture" rather than some random unlabelled
+// image.
+func collectSlideText(slide *slideXML) string {
+	var b strings.Builder
+	for _, sp := range slide.CSld.SpTree.Shapes {
+		for _, p := range sp.TxBody.Paragraphs {
+			text := plainParagraphText(&p)
+			if text == "" {
+				continue
+			}
+			if b.Len() > 0 {
+				b.WriteByte(' ')
+			}
+			b.WriteString(text)
+		}
+	}
+	return strings.TrimSpace(b.String())
+}
+
+// plainParagraphText returns the text content of a p:p stripped of any
+// HTML escaping and run formatting. Runs are concatenated with spaces so
+// the result reads naturally when the describer sees it.
+func plainParagraphText(p *paragraphXML) string {
+	var b strings.Builder
+	for _, n := range p.Nodes {
+		local := strings.ToLower(n.XMLName.Local)
+		if local == "r" || local == "fld" {
+			var r runXML
+			if err := xml.Unmarshal(n.Raw, &r); err == nil {
+				if b.Len() > 0 {
+					b.WriteByte(' ')
+				}
+				b.WriteString(r.Text)
+			}
+		}
+	}
+	return strings.TrimSpace(b.String())
 }
 
 // writeShape handles one p:sp. Title placeholders render as <h2>; other
@@ -357,7 +431,20 @@ type hyperlinkXML struct {
 }
 
 type pictureXML struct {
+	NvPicPr  nvPicPrXML  `xml:"nvPicPr"`
 	BlipFill blipFillXML `xml:"blipFill"`
+}
+
+// nvPicPrXML captures the cNvPr element holding the author-supplied
+// descr ("alt text" in PowerPoint's image properties dialog). We only
+// need descr; everything else on cNvPr is ignored.
+type nvPicPrXML struct {
+	CNvPr cNvPrXML `xml:"cNvPr"`
+}
+
+type cNvPrXML struct {
+	Descr string `xml:"descr,attr"`
+	Title string `xml:"title,attr"`
 }
 
 type blipFillXML struct {

@@ -40,12 +40,28 @@ func extractDOCX(ctx context.Context, data []byte, opts Options) (string, Metada
 	}
 
 	styles, lists, props, _ := docx.LoadExtras(data)
+	authorAlts, _ := docx.LoadAuthorAlts(data)
+	notes, _ := docx.LoadNotes(data)
+	noteRefs, _ := docx.LoadNoteRefs(data)
+
+	// Reviewer comments are opt-in (Options.IncludeComments). When off,
+	// we still read them cheaply via a nil CommentRefIndex — parsing is
+	// O(notes) and the table is dropped immediately.
+	var commentRefs *docx.CommentRefIndex
+	if opts.IncludeComments {
+		if commentTable, cerr := docx.LoadComments(data); cerr == nil && !commentTable.Empty() {
+			commentRefs, _ = docx.LoadCommentRefs(data, commentTable)
+		}
+	}
 
 	walk := &docx.WalkCtx{
-		Doc:    doc,
-		Styles: styles,
-		Lists:  lists,
-		Images: map[string]docx.ImageRef{},
+		Doc:        doc,
+		Styles:     styles,
+		Lists:      lists,
+		AuthorAlts: authorAlts,
+		NoteRefs:   noteRefs,
+		Comments:   commentRefs,
+		Images:     map[string]docx.ImageRef{},
 	}
 	htmlBody := docx.Walk(walk)
 
@@ -73,17 +89,28 @@ func extractDOCX(ctx context.Context, data []byte, opts Options) (string, Metada
 	i := 0
 	for id, ref := range walk.Images {
 		images[id] = extractedImage{
-			ID:        ref.ID,
-			Index:     i,
-			Data:      ref.Data,
-			MimeType:  ref.MimeType,
-			Extension: ref.Extension,
+			ID:            ref.ID,
+			Index:         i,
+			Data:          ref.Data,
+			MimeType:      ref.MimeType,
+			Extension:     ref.Extension,
+			ContextBefore: ref.ContextBefore,
+			ContextAfter:  ref.ContextAfter,
+			AuthorAltText: ref.AuthorAltText,
 		}
 		i++
 	}
 	md, err = replaceImagePlaceholders(ctx, md, images, opts)
 	if err != nil {
 		return "", metaFromProps(props, FormatDOCX), wrapBackendError(FormatDOCX, err)
+	}
+
+	// Append GFM footnote definitions last. References inline in the
+	// body point back here; renderers that support footnotes link the
+	// two, renderers that don't show them as plain "[^fn-1]" tokens.
+	// Either way the LLM reader sees the association.
+	if !notes.Empty() {
+		md = strings.TrimRight(md, "\n") + "\n\n" + notes.RenderNoteBlock()
 	}
 
 	return strings.TrimSpace(md), metaFromProps(props, FormatDOCX), nil

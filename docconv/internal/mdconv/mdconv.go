@@ -13,6 +13,8 @@ import (
 	"github.com/JohannesKaufmann/html-to-markdown/v2/plugin/commonmark"
 	"github.com/JohannesKaufmann/html-to-markdown/v2/plugin/strikethrough"
 	"github.com/JohannesKaufmann/html-to-markdown/v2/plugin/table"
+
+	"golang.org/x/text/unicode/norm"
 )
 
 // convOnce lazily builds the shared converter. html-to-markdown/v2 converters
@@ -69,7 +71,16 @@ func tidy(s string) string {
 	s = strings.ReplaceAll(s, "\r", "\n")
 	s = listBoundaryCommentPattern.ReplaceAllString(s, "\n")
 	s = multiBlankLinePattern.ReplaceAllString(s, "\n\n")
-	return strings.TrimSpace(s)
+	s = strings.TrimSpace(s)
+	// Normalize to NFC as the final step. Without this, strings that
+	// look identical on screen (e.g. "café" composed vs decomposed) hash
+	// differently, break exact-match and deduplication, and split
+	// tokens across embeddings. All downstream consumers of our markdown
+	// can safely assume Unicode Normalization Form C.
+	if !norm.NFC.IsNormalString(s) {
+		s = norm.NFC.String(s)
+	}
+	return s
 }
 
 var (

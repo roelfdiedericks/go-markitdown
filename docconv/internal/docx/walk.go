@@ -21,6 +21,17 @@ type ImageRef struct {
 	MimeType string
 	// Extension includes the leading dot (".png").
 	Extension string
+
+	// ContextBefore / ContextAfter are short plaintext windows of the
+	// neighbouring paragraphs / table cells at the time the image was
+	// encountered, flowing through to the default describer prompt.
+	ContextBefore string
+	ContextAfter  string
+
+	// AuthorAltText is the wp:docPr/@descr attribute for this drawing,
+	// when the document author supplied one. Empty when the drawing has
+	// no descr.
+	AuthorAltText string
 }
 
 // WalkCtx holds everything the walker needs across a single call. Callers
@@ -33,14 +44,42 @@ type WalkCtx struct {
 	Styles *StyleTable
 	// Lists resolves numPr to bullet/ordered format. Optional.
 	Lists *ListTable
+	// AuthorAlts resolves rId -> wp:docPr/@descr. Optional; a nil value
+	// makes Lookup return "" for every rId.
+	AuthorAlts *AuthorAltTable
+	// NoteRefs maps body-item index to in-body foot/end-note refs, so
+	// the walker can splice [^fn-N] / [^en-N] anchors at the end of
+	// each paragraph/table containing them. Optional.
+	NoteRefs *NoteRefIndex
+	// Comments maps body-item index to reviewer comments anchored at
+	// that item. Optional; when non-nil, the walker emits HTML
+	// comments after the item's HTML so they survive mdconv.
+	Comments *CommentRefIndex
 	// Images is populated by Walk with every image encountered, keyed
 	// by rId in document order.
 	Images map[string]ImageRef
+
+	// itemTexts mirrors Doc.Body.Items by index, pre-flattened to
+	// plaintext once at the top of Walk. Image context windows are
+	// assembled by concatenating neighbouring entries, which keeps
+	// per-image work linear in window size rather than quadratic in
+	// document size.
+	itemTexts []string
+	// currentItem is the index of the item currently being walked.
+	// Updated by the outer loop and read by extractImage so the image
+	// knows where it sits in document order.
+	currentItem int
 }
 
-// Walk converts the document body to semantic HTML. Images are replaced with
-// placeholder tokens formatted as docconv expects: "![__rid_<id>__]()". The
-// orchestrator resolves those placeholders against WalkCtx.Images.
+// contextWindowChars is the maximum chars on each side of an image the
+// walker assembles for ContextBefore/ContextAfter. Enough to capture the
+// surrounding paragraph or table cell plus immediate neighbours; short
+// enough to keep the describer prompt compact.
+const contextWindowChars = 400
+
+// Walk converts the document body to semantic HTML. Images are replaced
+// with <img src="rid:<id>" alt=""/> placeholders; the orchestrator
+// resolves those against WalkCtx.Images after mdconv has run.
 func Walk(ctx *WalkCtx) string {
 	if ctx == nil || ctx.Doc == nil {
 		return ""
@@ -52,8 +91,17 @@ func Walk(ctx *WalkCtx) string {
 	var b strings.Builder
 	items := ctx.Doc.Document.Body.Items
 
+	// Precompute the plaintext form of every item so extractImage can
+	// assemble context windows in O(window) rather than re-flattening
+	// the whole body for each image.
+	ctx.itemTexts = make([]string, len(items))
+	for idx, it := range items {
+		ctx.itemTexts[idx] = flattenItemText(it)
+	}
+
 	i := 0
 	for i < len(items) {
+		ctx.currentItem = i
 		switch v := items[i].(type) {
 		case *fumiama.Paragraph:
 			// Group consecutive list-item paragraphs sharing the
@@ -72,17 +120,43 @@ func Walk(ctx *WalkCtx) string {
 					}
 					j++
 				}
-				writeList(&b, items[i:j], ctx)
+				writeList(&b, items[i:j], ctx, i)
 				i = j
 				continue
 			}
 			writeParagraph(&b, v, ctx)
+			writeItemAnnotations(&b, ctx, i)
 		case *fumiama.Table:
 			writeTable(&b, v, ctx)
+			writeItemAnnotations(&b, ctx, i)
 		}
 		i++
 	}
 	return b.String()
+}
+
+// writeItemAnnotations appends any reviewer-comment HTML comments and
+// foot/end-note reference anchors registered for this body item. Emitted
+// AFTER the item's HTML so the anchors sit at the tail of the paragraph
+// when rendered — close enough to the actual in-body position that they
+// still associate with the right content block for a human or LLM reader.
+//
+// Comments come first (so reviewer context sits flush against the
+// paragraph it annotated); note anchors follow (so they appear right
+// before the paragraph break, mirroring how Word renders them inline).
+func writeItemAnnotations(b *strings.Builder, ctx *WalkCtx, idx int) {
+	if ctx.Comments != nil {
+		for _, c := range ctx.Comments.At(idx) {
+			// HTML comments survive html-to-markdown untouched,
+			// which is what we want: invisible to rendered
+			// markdown viewers, visible to LLM tokenisers.
+			b.WriteString(c.HTMLComment())
+		}
+	}
+	refs := ctx.NoteRefs.Refs(idx)
+	for _, r := range refs {
+		fmt.Fprintf(b, "[^%s]", r.Anchor())
+	}
 }
 
 // listNumID returns the w:numId of a list-item paragraph, or "" when the
@@ -108,7 +182,12 @@ func isListItem(p *fumiama.Paragraph) bool {
 // writeList emits an <ul> / <ol> block for a contiguous run of list-item
 // paragraphs. When the numbering format is unknown the list is rendered as
 // <ul> for safety (markdown bullets are almost always acceptable).
-func writeList(b *strings.Builder, items []interface{}, ctx *WalkCtx) {
+//
+// startIdx is the absolute index of items[0] inside the body, used to keep
+// ctx.currentItem accurate while iterating the group (images inside list
+// items should see their correct neighbours, not the last value the outer
+// loop set).
+func writeList(b *strings.Builder, items []interface{}, ctx *WalkCtx, startIdx int) {
 	ordered := false
 	// Look at the first item's numPr to pick ul vs ol.
 	if first, ok := items[0].(*fumiama.Paragraph); ok && first.Properties != nil {
@@ -129,13 +208,19 @@ func writeList(b *strings.Builder, items []interface{}, ctx *WalkCtx) {
 	} else {
 		b.WriteString("<ul>")
 	}
-	for _, it := range items {
+	for off, it := range items {
 		p, ok := it.(*fumiama.Paragraph)
 		if !ok {
 			continue
 		}
+		absIdx := startIdx + off
+		ctx.currentItem = absIdx
 		b.WriteString("<li>")
 		writeRuns(b, p, ctx)
+		// Splice per-item annotations inside the <li> so each list
+		// entry carries its own notes/comments rather than all the
+		// list's annotations bunching up at the end.
+		writeItemAnnotations(b, ctx, absIdx)
 		b.WriteString("</li>")
 	}
 	if ordered {
@@ -310,16 +395,164 @@ func extractImage(d *fumiama.Drawing, ctx *WalkCtx) string {
 	mime := mimeForExt(ext)
 
 	// Use the rId directly as the placeholder key. If the same image is
-	// referenced twice we reuse the same entry — docconv's placeholder
-	// replace is resilient to duplicate ids.
-	ctx.Images[rID] = ImageRef{
-		ID:        rID,
-		MediaName: mediaName,
-		Data:      media.Data,
-		MimeType:  mime,
-		Extension: ext,
+	// referenced twice we reuse the first entry — the shared image
+	// pipeline dedupes describer calls per ID, so repeated logos cost
+	// one describer call regardless of how often they appear.
+	if _, seen := ctx.Images[rID]; !seen {
+		before, after := contextAroundItem(ctx.itemTexts, ctx.currentItem, contextWindowChars)
+		ctx.Images[rID] = ImageRef{
+			ID:            rID,
+			MediaName:     mediaName,
+			Data:          media.Data,
+			MimeType:      mime,
+			Extension:     ext,
+			ContextBefore: before,
+			ContextAfter:  after,
+			AuthorAltText: ctx.AuthorAlts.Lookup(rID),
+		}
 	}
 	return imagePlaceholder(rID)
+}
+
+// contextAroundItem returns up to budget chars of neighbouring text on
+// each side of idx, drawn from itemTexts. The current item itself appears
+// in both before and after — an image inside paragraph P gets P's text on
+// both sides as a grounding hint, plus adjacent paragraphs for flow.
+//
+// Gracefully handles out-of-range indexes by returning empty strings.
+func contextAroundItem(itemTexts []string, idx, budget int) (string, string) {
+	if idx < 0 || idx >= len(itemTexts) {
+		return "", ""
+	}
+	var beforeParts []string
+	remaining := budget
+	beforeParts = append(beforeParts, itemTexts[idx])
+	remaining -= len(itemTexts[idx])
+	for j := idx - 1; j >= 0 && remaining > 0; j-- {
+		t := itemTexts[j]
+		if t == "" {
+			continue
+		}
+		beforeParts = append([]string{t}, beforeParts...)
+		remaining -= len(t)
+	}
+	before := strings.TrimSpace(strings.Join(beforeParts, " "))
+	before = truncateTail(before, budget)
+
+	var afterParts []string
+	remaining = budget
+	afterParts = append(afterParts, itemTexts[idx])
+	remaining -= len(itemTexts[idx])
+	for j := idx + 1; j < len(itemTexts) && remaining > 0; j++ {
+		t := itemTexts[j]
+		if t == "" {
+			continue
+		}
+		afterParts = append(afterParts, t)
+		remaining -= len(t)
+	}
+	after := strings.TrimSpace(strings.Join(afterParts, " "))
+	after = truncateHead(after, budget)
+	return before, after
+}
+
+// truncateTail keeps the last budget chars of s, trimming on a word
+// boundary when the cut drops into a long word run.
+func truncateTail(s string, budget int) string {
+	if len(s) <= budget {
+		return s
+	}
+	tail := s[len(s)-budget:]
+	if space := strings.IndexByte(tail, ' '); space != -1 && space < len(tail)/4 {
+		tail = tail[space+1:]
+	}
+	return tail
+}
+
+// truncateHead keeps the first budget chars of s, trimming on a word
+// boundary when the cut drops into a long word run.
+func truncateHead(s string, budget int) string {
+	if len(s) <= budget {
+		return s
+	}
+	head := s[:budget]
+	if space := strings.LastIndexByte(head, ' '); space != -1 && space > len(head)*3/4 {
+		head = head[:space]
+	}
+	return head
+}
+
+// flattenItemText returns a compact plaintext view of an items slot
+// (paragraph or table). Image runs are skipped so the context window
+// never mentions the placeholder text. Whitespace is collapsed.
+func flattenItemText(item interface{}) string {
+	var b strings.Builder
+	switch v := item.(type) {
+	case *fumiama.Paragraph:
+		flattenParagraphText(&b, v)
+	case *fumiama.Table:
+		for i, row := range v.TableRows {
+			if i > 0 {
+				b.WriteByte(' ')
+			}
+			for j, cell := range row.TableCells {
+				if j > 0 {
+					b.WriteString(" | ")
+				}
+				for k, p := range cell.Paragraphs {
+					if k > 0 {
+						b.WriteByte(' ')
+					}
+					flattenParagraphText(&b, p)
+				}
+			}
+		}
+	}
+	return collapseWhitespace(b.String())
+}
+
+func flattenParagraphText(b *strings.Builder, p *fumiama.Paragraph) {
+	if p == nil {
+		return
+	}
+	for _, c := range p.Children {
+		switch v := c.(type) {
+		case *fumiama.Hyperlink:
+			for _, rc := range v.Run.Children {
+				if t, ok := rc.(*fumiama.Text); ok {
+					b.WriteString(t.Text)
+					b.WriteByte(' ')
+				}
+			}
+		case *fumiama.Run:
+			for _, rc := range v.Children {
+				if t, ok := rc.(*fumiama.Text); ok {
+					b.WriteString(t.Text)
+					b.WriteByte(' ')
+				}
+			}
+		}
+	}
+}
+
+// collapseWhitespace compresses any run of whitespace (including newlines
+// and tabs) to a single space and trims the ends. Keeps the plaintext
+// context windows compact and readable.
+func collapseWhitespace(s string) string {
+	var b strings.Builder
+	prevSpace := false
+	for _, r := range s {
+		if r == ' ' || r == '\t' || r == '\n' || r == '\r' {
+			if !prevSpace {
+				b.WriteByte(' ')
+				prevSpace = true
+			}
+			continue
+		}
+		b.WriteRune(r)
+		prevSpace = false
+	}
+	return strings.TrimSpace(b.String())
 }
 
 // imagePlaceholder emits the HTML img element that the shared placeholder

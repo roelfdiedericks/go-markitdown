@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] stable - 2026-04-22 — LLM-ready document pipeline
+
+Comprehensive upgrade to image handling, OCR, text quality, and DOCX structural content across all backends. The output format is a superset of v0.1 (all previously rendered content is still there, same shape); the library is now architected to give an LLM the best possible context per image with no manual configuration required.
+
+#### Added
+
+- **Unified image describer pipeline.** Every backend (PDF, DOCX, PPTX, XLSX, HTML, EPUB, MOBI) now routes images through the same shared post-pass. Images are extracted, deduplicated by content hash, and passed to `Options.LLMClient.DescribeImage` with a context-aware prompt built from surrounding document text and any author-supplied alt-text.
+- **Context-aware default prompt.** When `Options.DescribePrompt` is empty (the default), the library applies `DefaultDescribePromptTemplate` with neighbouring prose and author alt-text spliced in per image. When non-empty, the caller's prompt is used verbatim — context injection and `DECORATIVE` handling are disabled.
+- **`DecorativeMarker` sentinel.** Describers may return the literal string `"DECORATIVE"` to flag logos, ornaments, and rules; the library strips such images from the output rather than emitting placeholder alt-text. Honoured only on the library-owned prompt path.
+- **Author alt-text propagation.** DOCX `w:docPr/@descr`, PPTX `p:cNvPr/@descr`, XLSX `GraphicOptions.AltText`, and HTML `alt=""` all flow into the describer prompt as `AuthorAltText`, so the LLM can refine rather than invent captions.
+- **Per-page OCR fallback.** `Options.OCRFallback` now runs page-by-page (previously document-wide only when the entire document was empty). Mixed text/scanned PDFs are fully recovered — scanned pages are re-rendered at `OCRDPI` and transcribed via `ImageDescriber` while text pages pass through unchanged.
+- **PDF hyphenation rejoin.** `go-fitz`'s per-page HTML is now post-processed to rejoin lowercase-hyphen-newline-lowercase sequences ("confi-\nguration" → "configuration") before markdown conversion, so LLM tokenisers, search, and embeddings see whole words. Uppercase second halves, digits, and legitimate compound words are preserved.
+- **Page markers.** PDF, EPUB, and MOBI now emit `<!-- Page N of M -->` at every page boundary, mirroring PPTX's `<!-- Slide number: N -->`. Enables grounded citation by LLM agents reading the output.
+- **Unicode NFC normalisation.** All markdown output is normalised to Unicode Normalization Form C as the final conversion step. Prevents silent hash / embedding / dedup failures from mixed composed/decomposed representations.
+- **DOCX footnotes and endnotes.** `word/footnotes.xml` and `word/endnotes.xml` are parsed and rendered as GFM footnote syntax: in-body references become `[^fn-N]` anchors and a `## Footnotes` block is appended at the end.
+- **DOCX reviewer comments (opt-in).** `Options.IncludeComments = true` surfaces `word/comments.xml` content as inline HTML comments at the original anchor point. Default is `false` so LLM content signal isn't diluted with review-cycle metadata unless explicitly requested.
+- **HTML `data:` URI capture.** Inline base64 `<img>` tags are decoded, deduplicated, and routed through the describer pipeline just like OOXML images. Real `http(s)://` URLs are left untouched — the library never fetches remote resources.
+- **XLSX embedded images.** Pictures anchored on each sheet are extracted via `excelize.GetPictures`, rendered after the sheet's table, and described with sheet + anchor context.
+
+#### Changed
+
+- **`Options.DescribePrompt` semantics.** Empty now means "library-owned prompt with context" (new behaviour); previously it defaulted to a hardcoded string. Callers who want full control of the prompt must now explicitly set it. The legacy `DefaultDescribePrompt` constant is retained for reference but is no longer applied automatically.
+- **`compare-msft-llm`** CPQ.pdf added to the informational fixtures list. The parity comparison is explicitly documented as informational — Microsoft's markitdown image-description quality is not a target.
+
+#### Internal
+
+- New package entry points: `docconv/internal/docx/authoralt.go`, `docconv/internal/docx/footnotes.go`, `docconv/internal/docx/comments.go`.
+- Shared helpers in `docconv/images.go`: `shortHash`, `extensionForMime`, `buildDefaultDescribePrompt`, `joinContext`.
+- New tests: `docconv/images_test.go`, `docconv/xlsx_test.go`, `docconv/html_test.go`, `docconv/internal/mdconv/mdconv_test.go`; per-feature additions in the existing backend test files.
+
 ## [0.1.1] stable - 2026-04-22
 
 - docconv: new `Supports(mime)` / `FromMIME(mime)` helpers for MIME-keyed capability checks, so callers can decide whether to feed a file to `Extract` without touching disk.
@@ -30,6 +60,7 @@ Initial public release. Go library (`docconv` package) plus a standalone `go-mar
 - build system: `make build`, `make build-nofitz`, cross-compile targets for `{linux,darwin} x {amd64,arm64}` via `zig cc`, and `make install` into `$GOPATH/bin`
 - audit: `make audit` runs `golangci-lint`, `govulncheck`, and `gitleaks` against the tree, auto-installing any missing tool into `$GOBIN` on first run; `.gitleaks.toml` extends the stock rule set and allowlists test fixtures and local `.env` files
 
-[Unreleased]: https://github.com/roelfdiedericks/go-markitdown/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/roelfdiedericks/go-markitdown/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/roelfdiedericks/go-markitdown/releases/tag/v0.2.0
 [0.1.1]: https://github.com/roelfdiedericks/go-markitdown/releases/tag/v0.1.1
 [0.1.0]: https://github.com/roelfdiedericks/go-markitdown/releases/tag/v0.1.0

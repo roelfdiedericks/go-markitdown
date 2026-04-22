@@ -4,7 +4,7 @@ Convert common document formats (PDF, DOCX, XLSX, PPTX, EPUB, MOBI, HTML, plain 
 
 Inspired by Microsoft's Python [`markitdown`](https://github.com/microsoft/markitdown), but written to embed cleanly into other Go applications. First consumer is [goclaw](https://github.com/roelfdiedericks/goclaw), which feeds documents into LLM context.
 
-> **Status:** v0.1 / pre-release. API is stabilising. See [SPEC.md](SPEC.md) for the full design rationale.
+> **Status:** v0.2 / LLM-ready document pipeline. API is stabilising. See [SPEC.md](SPEC.md) for the full design rationale.
 
 ## Features
 
@@ -20,21 +20,37 @@ Inspired by Microsoft's Python [`markitdown`](https://github.com/microsoft/marki
 
 | Format | Text / structure | Image extraction | Backend |
 |--------|------------------|------------------|---------|
-| PDF    | Yes              | Page render only | `go-fitz` (MuPDF) |
-| DOCX   | Yes (headings, tables, lists, hyperlinks) | Yes (via `word/media/`) | `fumiama/go-docx` → `html-to-markdown`; `go-fitz` fallback on parse error |
-| XLSX   | Yes (tables / CSV) | Yes (OOXML zip walker) | `excelize` |
-| PPTX   | Yes (per-slide sections with `<!-- Slide number: N -->` markers, title detection, `a:tbl` tables) | Yes (via `ppt/media/` + slide rels) | hand-rolled stdlib-xml walker; `go-fitz` fallback on parse error |
-| EPUB   | Yes              | Yes              | `go-fitz` |
-| MOBI   | Yes              | Yes              | `go-fitz` |
-| HTML   | Yes              | Inline references | `go-readability` → `html-to-markdown` |
+| PDF    | Yes (hyphen rejoin + `<!-- Page N of M -->` markers) | Yes (inline images + per-page OCR fallback) | `go-fitz` (MuPDF) |
+| DOCX   | Yes (headings, tables, lists, hyperlinks, footnotes/endnotes, optional comments) | Yes (via `word/media/`, with `w:docPr/@descr` alt-text) | `fumiama/go-docx` → `html-to-markdown`; `go-fitz` fallback on parse error |
+| XLSX   | Yes (tables / CSV) | Yes (embedded pictures anchored per sheet, with `GraphicOptions.AltText`) | `excelize` |
+| PPTX   | Yes (per-slide sections with `<!-- Slide number: N -->` markers, title detection, `a:tbl` tables) | Yes (via `ppt/media/` + slide rels, with `p:cNvPr/@descr` alt-text) | hand-rolled stdlib-xml walker; `go-fitz` fallback on parse error |
+| EPUB   | Yes (`<!-- Page N of M -->` markers) | Yes              | `go-fitz` |
+| MOBI   | Yes (`<!-- Page N of M -->` markers) | Yes              | `go-fitz` |
+| HTML   | Yes              | Inline references + `data:` URI capture (real URLs left untouched) | `go-readability` → `html-to-markdown` |
 | Text   | Yes              | —                | stdlib |
 | Images | —                | —                | Returns `ErrUnsupportedFormat`; pass to a multimodal model directly. |
 
 DOCX and PPTX use structure-preserving native parsers and fall back to `go-fitz` only when the primary parse fails — the fallback keeps the output usable on malformed inputs without penalising well-formed documents, which is the common case.
 
-**DOCX limitations.** `fumiama/go-docx` focuses on the document body and silently drops headers/footers, footnotes, comments, tracked changes, tables of contents, `w:sdt` content controls, bookmarks, and field codes. For v0.1 we consider this an acceptable trade-off: body text, tables, headings, and links carry the weight of LLM context quality. Internal bookmark links like `[Top of this Page](#anchor)` currently render as plain text.
+**DOCX limitations.** `fumiama/go-docx` focuses on the document body. As of v0.2 we splice in footnotes and endnotes (rendered as GFM `[^fn-N]` anchors plus a `## Footnotes` block) and optionally surface reviewer comments (via `Options.IncludeComments`). Still dropped: headers/footers, tracked changes, tables of contents, `w:sdt` content controls, bookmarks, and field codes. Internal bookmark links like `[Top of this Page](#anchor)` render as plain text.
 
-Scanned / text-less PDFs return `ErrNoText` unless `--ocr-fallback` (CLI) or `Options.OCRFallback` (library) is set, in which case each page is rendered and OCR'd via your `ImageDescriber`.
+Scanned / text-less PDFs used to return `ErrNoText` unless OCR fallback was enabled. As of v0.2, OCR runs per page: each page whose extracted text is effectively empty (e.g. a scan in an otherwise-text PDF) is re-rendered and transcribed via your `ImageDescriber`. Enable with `--ocr-fallback` (CLI) or `Options.OCRFallback` (library); requires an `ImageDescriber`.
+
+### Image handling (v0.2)
+
+Every backend now flows through the same shared image post-pass:
+
+- **Context-aware prompts.** When `Options.DescribePrompt` is empty the library builds a prompt per image that carries the surrounding document text (paragraph neighbours for DOCX, slide text for PPTX, sheet text + anchor cell for XLSX, HTML windows for PDF/EPUB/MOBI/HTML) and any author-supplied alt-text (`w:docPr/@descr`, `p:cNvPr/@descr`, `GraphicOptions.AltText`, HTML `alt=""`). When `Options.DescribePrompt` is set, it is used verbatim and context is not injected — the caller owns the prompt.
+- **Dedup by content hash.** Identical bytes are described once, regardless of how many times they appear. Logos repeated on every slide cost one describer call, not N.
+- **Decorative sentinel.** The describer may return the sentinel string `DECORATIVE` to flag images that carry no informational content (logos, rules, ornaments). The library strips such images from the output instead of emitting noise alt-text. Honoured only on the library-owned prompt path.
+- **`data:` URI capture.** PDF and HTML sources frequently embed images as inline base64; these are decoded, deduplicated, and optionally persisted via `ImageDir` just like any other image.
+- **No remote I/O.** Real `http(s)://` image URLs in HTML are left untouched — the library never fetches them.
+
+### Text quality (v0.2)
+
+- **Hyphen rejoin.** PDF text extraction splits line-wrapped words (`confi-\nguration`). The fitz pipeline now rejoins them before markdown conversion so LLM tokenisers, search, and embeddings see whole words.
+- **Page markers.** PDF, EPUB, and MOBI emit `<!-- Page N of M -->` at every page boundary (mirroring PPTX's `<!-- Slide number: N -->`) so LLM answers can cite back into the source.
+- **Unicode NFC.** All output is normalised to Unicode Normalization Form C. Prevents the silent dedup and embedding failures that come from mixing composed/decomposed forms of the same text.
 
 ## Install
 
@@ -141,9 +157,10 @@ type Options struct {
     IncludeImages   bool           // reference / describe embedded images
     ImageDir        string         // write extracted images to disk
     IncludeMetadata bool           // prepend YAML front-matter
-    OCRFallback     bool           // OCR via LLMClient when text extraction is empty
+    IncludeComments bool           // DOCX only: surface reviewer comments as HTML comments
+    OCRFallback     bool           // OCR via LLMClient when a page's text is empty (per-page)
     OCRDPI          float64        // render DPI for OCR pages (default 200)
-    DescribePrompt  string         // override default image-description prompt
+    DescribePrompt  string         // empty = library-owned context-aware prompt; non-empty = caller-owned verbatim
     OCRPrompt       string         // override default OCR prompt
 }
 
@@ -220,7 +237,7 @@ The `--llm` mode (`make compare-msft-llm`) runs our CLI with `examples/describer
 
 ## Roadmap
 
-- **v0.2** — Metadata extraction across all formats, better XLSX heuristics (merged cells, frozen panes), in-document-order image placement for OOXML.
+- **v0.2** — LLM-ready document pipeline: unified context-aware image describer hook across all formats; content-hash dedup; DECORATIVE stripping; per-page OCR; PDF hyphen rejoin; page markers; DOCX footnotes/endnotes; optional DOCX comments; Unicode NFC normalisation. (**done — this release**)
 - **v0.3** — Adapters for classical OCR engines (Tesseract, PaddleOCR, cloud OCR) implementing `ImageDescriber`.
 - **v0.4** — Structured extraction API (`ExtractStructured` returning a typed `Document` for callers that want to shape the output themselves).
 

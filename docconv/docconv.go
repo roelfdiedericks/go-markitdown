@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+
+	"golang.org/x/text/unicode/norm"
 )
 
 // ImageDescriber describes images for LLM context. Consumers implement this
@@ -71,25 +73,98 @@ type Options struct {
 	OCRDPI float64
 
 	// DescribePrompt overrides the default prompt used for embedded-image
-	// description. Empty means use the library default.
+	// description.
+	//
+	// When empty (the default), the library applies DefaultDescribePromptTemplate
+	// with the surrounding document text and any author-supplied alt-text
+	// spliced in; it also honours the DecorativeMarker sentinel by
+	// suppressing images the describer flags as DECORATIVE.
+	//
+	// When set to a non-empty string, the caller's prompt is used verbatim
+	// for every image — surrounding document text and author alt-text are
+	// NOT injected, and DecorativeMarker handling is disabled. Callers who
+	// want to own prompt semantics take the whole prompt.
 	DescribePrompt string
 
 	// OCRPrompt overrides the default prompt used for OCR fallback pages.
 	// Empty means use the library default.
 	OCRPrompt string
+
+	// IncludeComments, when true, surfaces reviewer comments (currently
+	// DOCX word/comments.xml) inline as HTML comments at each anchor
+	// position: "<!-- comment by AUTHOR (DATE): TEXT -->". HTML comments
+	// survive markdown conversion untouched — invisible in rendered
+	// markdown, present in the byte stream that LLMs tokenise.
+	//
+	// Off by default because reviewer chatter degrades the "what does this
+	// document say" signal LLM-agent consumers expect (unresolved
+	// disputes can be treated as document claims). Turn on for audit,
+	// legal review, or version-archaeology workflows where reviewer
+	// context is itself the content of interest.
+	IncludeComments bool
 }
 
-// Default prompts used by the library when Options.{Describe,OCR}Prompt is
-// empty. These are exported so CLI wrappers and tests can reference them.
+// Default prompts and constants used by the library when the corresponding
+// Options fields are zero-valued. Exported so CLI wrappers and tests can
+// reference them.
 const (
+	// DefaultDescribePrompt is a flat prompt preserved for back-compat with
+	// callers and CLI wrappers that want a complete prompt string rather
+	// than the context-aware template. New callers should prefer leaving
+	// Options.DescribePrompt empty so the library applies
+	// DefaultDescribePromptTemplate with surrounding document context.
 	DefaultDescribePrompt = "Describe this image for a reader who cannot see it. Keep it under two sentences."
-	DefaultOCRPrompt      = "Transcribe all text in this image verbatim. Preserve headings, lists, and tables as markdown. Do not add commentary."
-	DefaultOCRDPI         = 200.0
+
+	// DefaultOCRPrompt is used when OCRPrompt is empty.
+	DefaultOCRPrompt = "Transcribe all text in this image verbatim. Preserve headings, lists, and tables as markdown. Do not add commentary."
+
+	// DefaultOCRDPI is the page-render resolution used for OCR fallback.
+	DefaultOCRDPI = 200.0
+
+	// DecorativeMarker is the sentinel an ImageDescriber may return to
+	// signal that an image carries no informational content (logo, rule,
+	// ornament). docconv drops such images from output rather than
+	// emitting noisy placeholder alt-text.
+	//
+	// Honoured only when DescribePrompt is empty (library-owned prompt
+	// path); caller-supplied prompts bypass DECORATIVE handling because
+	// the caller's prompt may use the word for other purposes.
+	DecorativeMarker = "DECORATIVE"
 )
+
+// DefaultDescribePromptTemplate is the prompt docconv applies when
+// Options.DescribePrompt is empty. Apply with fmt.Sprintf and exactly two
+// %s substitutions in order: surrounding document text (may be empty), and
+// author-supplied alt-text (may be empty).
+//
+// Designed to be register-agnostic: surrounding text carries the tone
+// (technical datasheet vs. narrative prose), so the prompt itself does not
+// attempt to classify document type.
+const DefaultDescribePromptTemplate = `Produce a concise caption of this image for inclusion in a markdown document that will be read by a language model.
+
+Surrounding document text (may or may not be relevant to the image):
+%s
+
+Author-supplied alt-text (may be empty; when present, refine rather than replace):
+%s
+
+Rules:
+- 1-3 sentences, plain text, no preamble. Inline markdown emphasis (backticks, asterisks, underscores) is allowed when it clarifies a term.
+- If the surrounding text describes the image (e.g. "Figure 3: ...", a caption, or a reference like "as shown above"), ground your caption in that description and add only what the image itself reveals.
+- If author-supplied alt-text is present, treat it as authoritative intent. Expand or correct it against what you actually see; do not discard it.
+- If both surrounding text and author alt-text are unrelated or empty, describe the image on its own.
+- Prefer concrete detail (what it shows, labels, values, structure) over interpretation.
+- If the image is a logo, icon, decorative rule, or purely decorative, return exactly: DECORATIVE`
 
 // resolvedOptions returns a non-nil Options with zero values filled in from
 // the library defaults. Callers should pass resolvedOptions to backend
 // functions rather than raw *Options to avoid repeated nil checks.
+//
+// DescribePrompt is deliberately NOT default-filled here: the shared image
+// pipeline (replaceImagePlaceholders) treats an empty DescribePrompt as
+// "library owns the prompt" and applies DefaultDescribePromptTemplate with
+// surrounding-document context per image. A non-empty value signals caller
+// opt-in to owning the prompt verbatim.
 func resolvedOptions(opts *Options) Options {
 	var out Options
 	if opts != nil {
@@ -97,9 +172,6 @@ func resolvedOptions(opts *Options) Options {
 	}
 	if out.OCRDPI == 0 {
 		out.OCRDPI = DefaultOCRDPI
-	}
-	if out.DescribePrompt == "" {
-		out.DescribePrompt = DefaultDescribePrompt
 	}
 	if out.OCRPrompt == "" {
 		out.OCRPrompt = DefaultOCRPrompt
@@ -195,6 +267,16 @@ func extract(ctx context.Context, data []byte, format Format, opts Options) (str
 
 	if opts.IncludeMetadata {
 		md = renderMetadataFrontMatter(meta) + md
+	}
+
+	// Final NFC normalization. mdconv.tidy() already normalises
+	// everything that passes through html-to-markdown, but a few
+	// backends (XLSX, plain text) assemble markdown directly and the
+	// metadata front-matter is concatenated post-tidy. Normalising once
+	// here is cheap (no-op when already NFC) and guarantees every byte
+	// the library hands back to callers is in the same Unicode form.
+	if !norm.NFC.IsNormalString(md) {
+		md = norm.NFC.String(md)
 	}
 
 	return md, nil

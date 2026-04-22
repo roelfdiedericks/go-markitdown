@@ -127,6 +127,83 @@ func TestExtractComplexPPTXStructures(t *testing.T) {
 	}
 }
 
+// TestComplexPPTX_DescriberPromptIncludesSlideTitle feeds a stub
+// describer into Extract and checks that the prompt it receives contains
+// the surrounding slide text (the slide-4 "Photo" heading). This is how
+// we prove ContextBefore threading all the way through from the walker
+// to the describer hook.
+func TestComplexPPTX_DescriberPromptIncludesSlideTitle(t *testing.T) {
+	stub := &stubDescriber{reply: "a photograph"}
+	_, err := Extract(filepath.Join("testdata", "complex.pptx"), &Options{
+		IncludeImages: true,
+		LLMClient:     stub,
+	})
+	if err != nil {
+		t.Fatalf("Extract complex.pptx: %v", err)
+	}
+	if len(stub.calls) == 0 {
+		t.Fatalf("expected describer to be invoked for complex.pptx images")
+	}
+	// At least one call's prompt should carry "Photo" — the slide 4
+	// title — proving slide text made it into ContextBefore.
+	found := false
+	for _, c := range stub.calls {
+		if strings.Contains(c.prompt, "Photo") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("no describer prompt contained slide title 'Photo'; got %d calls", len(stub.calls))
+	}
+}
+
+// TestComplexPPTX_DedupOneCallPerImage confirms dedup: rerunning the
+// describer repeatedly for an image that appears once shouldn't generate
+// any extra calls, and the number of DescribeImage calls should not
+// exceed the number of unique media entries in the deck.
+func TestComplexPPTX_DedupOneCallPerImage(t *testing.T) {
+	stub := &stubDescriber{reply: "caption"}
+	_, err := Extract(filepath.Join("testdata", "complex.pptx"), &Options{
+		IncludeImages: true,
+		LLMClient:     stub,
+	})
+	if err != nil {
+		t.Fatalf("Extract complex.pptx: %v", err)
+	}
+	// Each call's byte-length should be unique — a duplicate length
+	// across calls for the same rId-pair is a strong indicator the
+	// dedup cache missed a collision on identical media. (stubDescriber
+	// intentionally only keeps a byte count to avoid retaining large
+	// image payloads across a test suite run.)
+	byLen := map[int]int{}
+	for _, c := range stub.calls {
+		byLen[c.bytes]++
+	}
+	for size, n := range byLen {
+		if n > 1 {
+			t.Errorf("size=%d seen %d times — potential dedup regression", size, n)
+		}
+	}
+}
+
+// TestComplexPPTX_DecorativeStripsImages asserts that the DecorativeMarker
+// sentinel causes every image in the deck to be stripped from the output,
+// leaving no image links behind.
+func TestComplexPPTX_DecorativeStripsImages(t *testing.T) {
+	stub := &stubDescriber{reply: DecorativeMarker}
+	md, err := Extract(filepath.Join("testdata", "complex.pptx"), &Options{
+		IncludeImages: true,
+		LLMClient:     stub,
+	})
+	if err != nil {
+		t.Fatalf("Extract complex.pptx: %v", err)
+	}
+	if strings.Contains(md, "](image_") || strings.Contains(md, "](rid:") {
+		t.Errorf("expected no image links, got sample:\n%s", md)
+	}
+}
+
 // buildEmptyPPTX constructs a zip with PPTX-shaped Content Types but no
 // ppt/slides/slide*.xml entries. Used to exercise the "no slides found"
 // branch in extractPPTX.

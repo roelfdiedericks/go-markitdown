@@ -57,11 +57,13 @@ func extractPPTX(ctx context.Context, data []byte, opts Options) (string, Metada
 				continue
 			}
 			allImages[id] = extractedImage{
-				ID:        id,
-				Index:     imageIdx,
-				Data:      ref.Data,
-				MimeType:  ref.MimeType,
-				Extension: ref.Extension,
+				ID:            id,
+				Index:         imageIdx,
+				Data:          ref.Data,
+				MimeType:      ref.MimeType,
+				Extension:     ref.Extension,
+				ContextBefore: ref.ContextBefore,
+				AuthorAltText: ref.AuthorAltText,
 			}
 			imageIdx++
 		}

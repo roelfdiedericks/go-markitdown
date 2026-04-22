@@ -95,6 +95,7 @@ FIXTURES_PRIMARY=(
 )
 FIXTURES_INFO=(
     "pdf:docconv/testdata/test.pdf"
+    "pdf-cpq:docconv/testdata/CPQ.pdf"
 )
 
 run_pair() {

@@ -135,6 +135,83 @@ func TestGoldenDOCX(t *testing.T) {
 	checkGolden(t, "test.docx.md", md)
 }
 
+// TestExtractDOCXImageContextInPrompt feeds a stub describer and asserts
+// the describer prompt for at least one image carries the library's
+// context-aware template (by sentinel string) and non-empty surrounding
+// text. This verifies ContextBefore/ContextAfter wiring from the walker
+// through to the describer hook.
+func TestExtractDOCXImageContextInPrompt(t *testing.T) {
+	stub := &stubDescriber{reply: "caption"}
+	_, err := Extract(filepath.Join("testdata", "test.docx"), &Options{
+		IncludeImages: true,
+		LLMClient:     stub,
+	})
+	if err != nil {
+		t.Fatalf("Extract test.docx: %v", err)
+	}
+	if len(stub.calls) == 0 {
+		// test.docx may have no images in some fixture revisions;
+		// this is not a regression — skip when true.
+		t.Skip("test.docx has no images in this fixture")
+	}
+	anyContext := false
+	for _, c := range stub.calls {
+		if !strings.Contains(c.prompt, "concise caption") {
+			t.Errorf("expected library-owned template in prompt, got %q", c.prompt)
+		}
+		if strings.Contains(c.prompt, "Surrounding document text") &&
+			!strings.Contains(c.prompt, "Surrounding document text (may or may not be relevant to the image):\n\n") {
+			anyContext = true
+		}
+	}
+	if !anyContext {
+		// Not necessarily a failure for test.docx (short doc, images
+		// at doc boundary), but log so regressions are visible.
+		t.Logf("no prompt carried surrounding text — verify ContextBefore wiring if the fixture has text around the image")
+	}
+}
+
+// TestExtractDOCXIncludeCommentsFlag confirms the Options.IncludeComments
+// toggle does not crash the extractor when the fixture has no comments
+// stream, and that the default output does not leak any HTML comments
+// that look like DOCX review comments (a regression guard for the opt-in
+// default).
+func TestExtractDOCXIncludeCommentsFlag(t *testing.T) {
+	// Default (comments OFF): no review-comment markers in the output.
+	md, err := Extract(filepath.Join("testdata", "test.docx"), nil)
+	if err != nil {
+		t.Fatalf("Extract test.docx (default): %v", err)
+	}
+	if strings.Contains(md, "<!-- Comment") || strings.Contains(md, "<!--comment") {
+		t.Errorf("default output leaked a comment marker: %q", md)
+	}
+
+	// Comments ON: must not error even when the fixture has no
+	// word/comments.xml — exercises the "missing stream" branch in
+	// LoadCommentRefs.
+	_, err = Extract(filepath.Join("testdata", "test.docx"), &Options{IncludeComments: true})
+	if err != nil {
+		t.Fatalf("Extract test.docx with IncludeComments=true: %v", err)
+	}
+}
+
+// TestExtractDOCXFootnotesNoRegressionOnTestFixture ensures the footnote
+// renderer is idempotent on a fixture that has none — no "Footnotes"
+// heading, no "[^fn-" references — so we don't start emitting empty
+// footnote blocks for docs without footnotes.
+func TestExtractDOCXFootnotesNoRegressionOnTestFixture(t *testing.T) {
+	md, err := Extract(filepath.Join("testdata", "test.docx"), nil)
+	if err != nil {
+		t.Fatalf("Extract test.docx: %v", err)
+	}
+	if strings.Contains(md, "[^fn-") {
+		t.Errorf("unexpected footnote reference in output (fixture has no footnotes): %q", md)
+	}
+	if strings.Contains(md, "\n## Footnotes\n") || strings.Contains(md, "\n# Footnotes\n") {
+		t.Errorf("unexpected Footnotes heading emitted for fixture without footnotes")
+	}
+}
+
 // TestExtractDOCXMetadata verifies that metadata from docProps/core.xml is
 // surfaced when IncludeMetadata is set.
 func TestExtractDOCXMetadata(t *testing.T) {

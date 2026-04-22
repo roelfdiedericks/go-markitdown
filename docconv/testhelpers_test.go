@@ -3,9 +3,37 @@ package docconv
 import (
 	"archive/zip"
 	"bytes"
+	"context"
 	"os"
 	"testing"
 )
+
+// stubDescriber captures every DescribeImage call for assertion. Shared
+// across backend tests because every backend exercises the same
+// ImageDescriber hook; duplicating this per-file previously forced
+// fitz_doc_test.go to keep its !nofitz build tag on the helper and
+// broke -tags nofitz test builds for xlsx/html/pptx tests.
+type stubDescriber struct {
+	calls []struct {
+		mime   string
+		prompt string
+		bytes  int
+	}
+	reply string
+	err   error
+}
+
+func (s *stubDescriber) DescribeImage(_ context.Context, img []byte, mime, prompt string) (string, error) {
+	s.calls = append(s.calls, struct {
+		mime   string
+		prompt string
+		bytes  int
+	}{mime: mime, prompt: prompt, bytes: len(img)})
+	if s.err != nil {
+		return "", s.err
+	}
+	return s.reply, nil
+}
 
 // mustRead reads a testdata file and fails the test on error.
 func mustRead(t *testing.T, path string) []byte {
